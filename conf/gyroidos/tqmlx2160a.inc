@@ -1,7 +1,8 @@
 MACHINE="tqmlx2160a-mblx2160a"
 
 #PREFERRED_PROVIDER_virtual/kernel:tqmlx2160a = "linux-rolling-stable"
-PREFERRED_PROVIDER_virtual/kernel:tqmlx2160a = "linux-tq"
+PREFERRED_PROVIDER_virtual/kernel:tqmlx2160a = "linux-rolling-lts"
+#PREFERRED_PROVIDER_virtual/kernel:tqmlx2160a = "linux-tq"
 
 INITRAMFS_IMAGE = "gyroidos-cml-initramfs"
 INITRAMFS_IMAGE_BUNDLE = "0"
