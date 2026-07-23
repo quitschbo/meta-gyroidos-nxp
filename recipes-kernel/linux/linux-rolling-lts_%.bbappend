@@ -1,19 +1,15 @@
 FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
 
-SRC_URI += "file://${MACHINE}.cfg"
-
 SRC_URI += "file://0001-arm64-dts-lx2160a-enable-crypto-device-node-for-CAAM.patch"
 
-KBUILD_DEFCONFIG:tqma8mpxl = "defconfig"
-KBUILD_DEFCONFIG:tqmlx2160a = "defconfig"
-KBUILD_DEFCONFIG:ls1088ardb-pb = "defconfig"
-KERNEL_FEATURES:remove = "cfg/fs/vfat.scc"
+SRC_URI += "\
+        file://0001-docs-trusted-encrypted-trusted-keys-as-protected-key.patch \
+        file://0002-KEYS-trusted-caam-based-protected-key.patch \
+        file://0003-crypto-caam-Add-support-of-paes-algorithm.patch \
+"
 
-# since kernel 6.17, this was renamed
-KERNEL_DEVICETREE:tqma8mpxl:remove = "freescale/imx8mp-tqma8mpql-mba8mpxl-lvds.dtb"
-KERNEL_DEVICETREE:tqma8mpxl:remove = "freescale/imx8mp-tqma8mpql-mba8mpxl-lvds.dtbo"
-KERNEL_DEVICETREE:tqma8mpxl:append = " freescale/imx8mp-tqma8mpql-mba8mpxl-lvds-tm070jvhg33.dtb"
-KERNEL_DEVICETREE:tqma8mpxl:append = " freescale/imx8mp-tqma8mpql-mba8mpxl-lvds-tm070jvhg33.dtbo"
+KBUILD_DEFCONFIG:tqmlx2160a = "defconfig"
+KERNEL_FEATURES:remove = "cfg/fs/vfat.scc"
 
 SRC_URI:append:tqmlx2160a = "\
     file://tq/qoriq/disable-imx-platforms.cfg \

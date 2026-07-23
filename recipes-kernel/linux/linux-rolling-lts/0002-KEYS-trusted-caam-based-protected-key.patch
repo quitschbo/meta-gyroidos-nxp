@@ -1,0 +1,451 @@
+From a703a4c2a3280835003d4d0eb8845bac0f1a6ef1 Mon Sep 17 00:00:00 2001
+From: Meenakshi Aggarwal <meenakshi.aggarwal@nxp.com>
+Date: Mon, 6 Oct 2025 09:17:52 +0200
+Subject: [PATCH 2/3] KEYS: trusted: caam based protected key
+
+- CAAM supports two types of protected keys:
+  -- Plain key encrypted with ECB
+  -- Plain key encrypted with CCM
+  Due to robustness, default encryption used for protected key is CCM.
+
+- Generate protected key blob and add it to trusted key payload.
+  This is done as part of sealing operation, which is triggered
+  when below two operations are requested:
+  -- new key generation
+  -- load key,
+
+Signed-off-by: Pankaj Gupta <pankaj.gupta@nxp.com>
+Signed-off-by: Meenakshi Aggarwal <meenakshi.aggarwal@nxp.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+---
+ drivers/crypto/caam/blob_gen.c            |  86 +++++++++++++----
+ drivers/crypto/caam/desc.h                |   9 +-
+ include/soc/fsl/caam-blob.h               |  26 ++++++
+ security/keys/trusted-keys/trusted_caam.c | 108 ++++++++++++++++++++++
+ 4 files changed, 212 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/crypto/caam/blob_gen.c b/drivers/crypto/caam/blob_gen.c
+index 079a22cc9f02..c18dbac56493 100644
+--- a/drivers/crypto/caam/blob_gen.c
++++ b/drivers/crypto/caam/blob_gen.c
+@@ -2,13 +2,14 @@
+ /*
+  * Copyright (C) 2015 Pengutronix, Steffen Trumtrar <kernel@pengutronix.de>
+  * Copyright (C) 2021 Pengutronix, Ahmad Fatoum <kernel@pengutronix.de>
+- * Copyright 2024 NXP
++ * Copyright 2024-2025 NXP
+  */
+ 
+ #define pr_fmt(fmt) "caam blob_gen: " fmt
+ 
+ #include <linux/bitfield.h>
+ #include <linux/device.h>
++#include <keys/trusted-type.h>
+ #include <soc/fsl/caam-blob.h>
+ 
+ #include "compat.h"
+@@ -60,18 +61,27 @@ static void caam_blob_job_done(struct device *dev, u32 *desc, u32 err, void *con
+ 	complete(&res->completion);
+ }
+ 
++static u32 check_caam_state(struct device *jrdev)
++{
++	const struct caam_drv_private *ctrlpriv;
++
++	ctrlpriv = dev_get_drvdata(jrdev->parent);
++	return FIELD_GET(CSTA_MOO, rd_reg32(&ctrlpriv->jr[0]->perfmon.status));
++}
++
+ int caam_process_blob(struct caam_blob_priv *priv,
+ 		      struct caam_blob_info *info, bool encap)
+ {
+-	const struct caam_drv_private *ctrlpriv;
+ 	struct caam_blob_job_result testres;
+ 	struct device *jrdev = &priv->jrdev;
+ 	dma_addr_t dma_in, dma_out;
+ 	int op = OP_PCLID_BLOB;
++	int hwbk_caam_ovhd = 0;
+ 	size_t output_len;
+ 	u32 *desc;
+ 	u32 moo;
+ 	int ret;
++	int len;
+ 
+ 	if (info->key_mod_len > CAAM_BLOB_KEYMOD_LENGTH)
+ 		return -EINVAL;
+@@ -82,14 +92,29 @@ int caam_process_blob(struct caam_blob_priv *priv,
+ 	} else {
+ 		op |= OP_TYPE_DECAP_PROTOCOL;
+ 		output_len = info->input_len - CAAM_BLOB_OVERHEAD;
++		info->output_len = output_len;
++	}
++
++	if (encap && info->pkey_info.is_pkey) {
++		op |= OP_PCL_BLOB_BLACK;
++		if (info->pkey_info.key_enc_algo == CAAM_ENC_ALGO_CCM) {
++			op |= OP_PCL_BLOB_EKT;
++			hwbk_caam_ovhd = CAAM_CCM_OVERHEAD;
++		}
++		if ((info->input_len + hwbk_caam_ovhd) > MAX_KEY_SIZE)
++			return -EINVAL;
++
++		len = info->input_len + hwbk_caam_ovhd;
++	} else {
++		len = info->input_len;
+ 	}
+ 
+ 	desc = kzalloc(CAAM_BLOB_DESC_BYTES_MAX, GFP_KERNEL);
+ 	if (!desc)
+ 		return -ENOMEM;
+ 
+-	dma_in = dma_map_single(jrdev, info->input, info->input_len,
+-				DMA_TO_DEVICE);
++	dma_in = dma_map_single(jrdev, info->input, len,
++				encap ? DMA_BIDIRECTIONAL : DMA_TO_DEVICE);
+ 	if (dma_mapping_error(jrdev, dma_in)) {
+ 		dev_err(jrdev, "unable to map input DMA buffer\n");
+ 		ret = -ENOMEM;
+@@ -104,8 +129,7 @@ int caam_process_blob(struct caam_blob_priv *priv,
+ 		goto out_unmap_in;
+ 	}
+ 
+-	ctrlpriv = dev_get_drvdata(jrdev->parent);
+-	moo = FIELD_GET(CSTA_MOO, rd_reg32(&ctrlpriv->jr[0]->perfmon.status));
++	moo = check_caam_state(jrdev);
+ 	if (moo != CSTA_MOO_SECURE && moo != CSTA_MOO_TRUSTED)
+ 		dev_warn(jrdev,
+ 			 "using insecure test key, enable HAB to use unique device key!\n");
+@@ -117,18 +141,48 @@ int caam_process_blob(struct caam_blob_priv *priv,
+ 	 * Class 1 Context DWords 0+1+2+3. The random BK is stored in the
+ 	 * Class 1 Key Register. Operation Mode is set to AES-CCM.
+ 	 */
+-
+ 	init_job_desc(desc, 0);
++
++	if (encap && info->pkey_info.is_pkey) {
++		/*!1. key command used to load class 1 key register
++		 *    from input plain key.
++		 */
++		append_key(desc, dma_in, info->input_len,
++				CLASS_1 | KEY_DEST_CLASS_REG);
++		/*!2. Fifostore to store protected key from class 1 key register. */
++		if (info->pkey_info.key_enc_algo == CAAM_ENC_ALGO_CCM) {
++			append_fifo_store(desc, dma_in, info->input_len,
++					  LDST_CLASS_1_CCB |
++					  FIFOST_TYPE_KEY_CCM_JKEK);
++		} else {
++			append_fifo_store(desc, dma_in, info->input_len,
++					  LDST_CLASS_1_CCB |
++					  FIFOST_TYPE_KEY_KEK);
++		}
++		/*
++		 * JUMP_OFFSET specifies the offset of the JUMP target from
++		 * the JUMP command's address in the descriptor buffer.
++		 */
++		append_jump(desc, JUMP_COND_NOP | BIT(0) << JUMP_OFFSET_SHIFT);
++	}
++
++	/*!3. Load class 2 key with key modifier. */
+ 	append_key_as_imm(desc, info->key_mod, info->key_mod_len,
+-			  info->key_mod_len, CLASS_2 | KEY_DEST_CLASS_REG);
+-	append_seq_in_ptr_intlen(desc, dma_in, info->input_len, 0);
+-	append_seq_out_ptr_intlen(desc, dma_out, output_len, 0);
++			info->key_mod_len, CLASS_2 | KEY_DEST_CLASS_REG);
++
++	/*!4. SEQ IN PTR Command. */
++	append_seq_in_ptr(desc, dma_in, info->input_len, 0);
++
++	/*!5. SEQ OUT PTR Command. */
++	append_seq_out_ptr(desc, dma_out, output_len, 0);
++
++	/*!6. Blob encapsulation/decapsulation PROTOCOL Command. */
+ 	append_operation(desc, op);
+ 
+-	print_hex_dump_debug("data@"__stringify(__LINE__)": ",
++	print_hex_dump_debug("data@" __stringify(__LINE__)": ",
+ 			     DUMP_PREFIX_ADDRESS, 16, 1, info->input,
+-			     info->input_len, false);
+-	print_hex_dump_debug("jobdesc@"__stringify(__LINE__)": ",
++			     len, false);
++	print_hex_dump_debug("jobdesc@" __stringify(__LINE__)": ",
+ 			     DUMP_PREFIX_ADDRESS, 16, 1, desc,
+ 			     desc_bytes(desc), false);
+ 
+@@ -139,7 +193,7 @@ int caam_process_blob(struct caam_blob_priv *priv,
+ 	if (ret == -EINPROGRESS) {
+ 		wait_for_completion(&testres.completion);
+ 		ret = testres.err;
+-		print_hex_dump_debug("output@"__stringify(__LINE__)": ",
++		print_hex_dump_debug("output@" __stringify(__LINE__)": ",
+ 				     DUMP_PREFIX_ADDRESS, 16, 1, info->output,
+ 				     output_len, false);
+ 	}
+@@ -149,10 +203,10 @@ int caam_process_blob(struct caam_blob_priv *priv,
+ 
+ 	dma_unmap_single(jrdev, dma_out, output_len, DMA_FROM_DEVICE);
+ out_unmap_in:
+-	dma_unmap_single(jrdev, dma_in, info->input_len, DMA_TO_DEVICE);
++	dma_unmap_single(jrdev, dma_in, len,
++			 encap ? DMA_BIDIRECTIONAL : DMA_TO_DEVICE);
+ out_free:
+ 	kfree(desc);
+-
+ 	return ret;
+ }
+ EXPORT_SYMBOL(caam_process_blob);
+diff --git a/drivers/crypto/caam/desc.h b/drivers/crypto/caam/desc.h
+index e13470901586..c28e94fcb8c7 100644
+--- a/drivers/crypto/caam/desc.h
++++ b/drivers/crypto/caam/desc.h
+@@ -4,7 +4,7 @@
+  * Definitions to support CAAM descriptor instruction generation
+  *
+  * Copyright 2008-2011 Freescale Semiconductor, Inc.
+- * Copyright 2018 NXP
++ * Copyright 2018, 2025 NXP
+  */
+ 
+ #ifndef DESC_H
+@@ -162,6 +162,7 @@
+  * Enhanced Encryption of Key
+  */
+ #define KEY_EKT			0x00100000
++#define KEY_EKT_OFFSET		20
+ 
+ /*
+  * Encrypted with Trusted Key
+@@ -403,6 +404,7 @@
+ #define FIFOST_TYPE_PKHA_N	 (0x08 << FIFOST_TYPE_SHIFT)
+ #define FIFOST_TYPE_PKHA_A	 (0x0c << FIFOST_TYPE_SHIFT)
+ #define FIFOST_TYPE_PKHA_B	 (0x0d << FIFOST_TYPE_SHIFT)
++#define FIFOST_TYPE_KEY_CCM_JKEK (0x14 << FIFOST_TYPE_SHIFT)
+ #define FIFOST_TYPE_AF_SBOX_JKEK (0x20 << FIFOST_TYPE_SHIFT)
+ #define FIFOST_TYPE_AF_SBOX_TKEK (0x21 << FIFOST_TYPE_SHIFT)
+ #define FIFOST_TYPE_PKHA_E_JKEK	 (0x22 << FIFOST_TYPE_SHIFT)
+@@ -1001,6 +1003,11 @@
+ #define OP_PCL_TLS12_AES_256_CBC_SHA384		 0xff63
+ #define OP_PCL_TLS12_AES_256_CBC_SHA512		 0xff65
+ 
++/* Blob protocol protinfo bits */
++
++#define OP_PCL_BLOB_BLACK                        0x0004
++#define OP_PCL_BLOB_EKT                          0x0100
++
+ /* For DTLS - OP_PCLID_DTLS */
+ 
+ #define OP_PCL_DTLS_AES_128_CBC_SHA		 0x002f
+diff --git a/include/soc/fsl/caam-blob.h b/include/soc/fsl/caam-blob.h
+index 937cac52f36d..922f7ec3e231 100644
+--- a/include/soc/fsl/caam-blob.h
++++ b/include/soc/fsl/caam-blob.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+  * Copyright (C) 2020 Pengutronix, Ahmad Fatoum <kernel@pengutronix.de>
++ * Copyright 2024-2025 NXP
+  */
+ 
+ #ifndef __CAAM_BLOB_GEN
+@@ -12,11 +13,34 @@
+ #define CAAM_BLOB_KEYMOD_LENGTH		16
+ #define CAAM_BLOB_OVERHEAD		(32 + 16)
+ #define CAAM_BLOB_MAX_LEN		4096
++#define CAAM_ENC_ALGO_CCM		0x1
++#define CAAM_ENC_ALGO_ECB		0x2
++#define CAAM_NONCE_SIZE			6
++#define CAAM_ICV_SIZE			6
++#define CAAM_CCM_OVERHEAD		(CAAM_NONCE_SIZE + CAAM_ICV_SIZE)
+ 
+ struct caam_blob_priv;
+ 
++/**
++ * struct caam_pkey_info - information for CAAM protected key
++ * @is_pkey:		flag to identify, if the key is protected.
++ * @key_enc_algo:	identifies the algorithm, ccm or ecb
++ * @plain_key_sz:	size of plain key.
++ * @key_buf:		contains key data
++ */
++struct caam_pkey_info {
++	u8  is_pkey;
++	u8  key_enc_algo;
++	u16 plain_key_sz;
++	u8 key_buf[];
++} __packed;
++
++/* sizeof struct caam_pkey_info */
++#define CAAM_PKEY_HEADER		4
++
+ /**
+  * struct caam_blob_info - information for CAAM blobbing
++ * @pkey_info:	 pointer to keep protected key information
+  * @input:       pointer to input buffer (must be DMAable)
+  * @input_len:   length of @input buffer in bytes.
+  * @output:      pointer to output buffer (must be DMAable)
+@@ -26,6 +50,8 @@ struct caam_blob_priv;
+  *	         May not exceed %CAAM_BLOB_KEYMOD_LENGTH
+  */
+ struct caam_blob_info {
++	struct caam_pkey_info pkey_info;
++
+ 	void *input;
+ 	size_t input_len;
+ 
+diff --git a/security/keys/trusted-keys/trusted_caam.c b/security/keys/trusted-keys/trusted_caam.c
+index e3415c520c0a..090099d1b04d 100644
+--- a/security/keys/trusted-keys/trusted_caam.c
++++ b/security/keys/trusted-keys/trusted_caam.c
+@@ -1,12 +1,14 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright (C) 2021 Pengutronix, Ahmad Fatoum <kernel@pengutronix.de>
++ * Copyright 2025 NXP
+  */
+ 
+ #include <keys/trusted_caam.h>
+ #include <keys/trusted-type.h>
+ #include <linux/build_bug.h>
+ #include <linux/key-type.h>
++#include <linux/parser.h>
+ #include <soc/fsl/caam-blob.h>
+ 
+ static struct caam_blob_priv *blobifier;
+@@ -16,6 +18,77 @@ static struct caam_blob_priv *blobifier;
+ static_assert(MAX_KEY_SIZE + CAAM_BLOB_OVERHEAD <= CAAM_BLOB_MAX_LEN);
+ static_assert(MAX_BLOB_SIZE <= CAAM_BLOB_MAX_LEN);
+ 
++enum {
++	opt_err,
++	opt_key_enc_algo,
++};
++
++static const match_table_t key_tokens = {
++	{opt_key_enc_algo, "key_enc_algo=%s"},
++	{opt_err, NULL}
++};
++
++#ifdef CAAM_DEBUG
++static inline void dump_options(struct caam_pkey_info pkey_info)
++{
++	pr_info("key encryption algo %d\n", pkey_info.key_enc_algo);
++}
++#else
++static inline void dump_options(struct caam_pkey_info pkey_info)
++{
++}
++#endif
++
++static int get_pkey_options(char *c,
++			    struct caam_pkey_info *pkey_info)
++{
++	substring_t args[MAX_OPT_ARGS];
++	unsigned long token_mask = 0;
++	u16 key_enc_algo;
++	char *p = c;
++	int token;
++	int res;
++
++	if (!c)
++		return 0;
++
++	while ((p = strsep(&c, " \t"))) {
++		if (*p == '\0' || *p == ' ' || *p == '\t')
++			continue;
++		token = match_token(p, key_tokens, args);
++		if (test_and_set_bit(token, &token_mask))
++			return -EINVAL;
++
++		switch (token) {
++		case opt_key_enc_algo:
++			res = kstrtou16(args[0].from, 16, &key_enc_algo);
++			if (res < 0)
++				return -EINVAL;
++			pkey_info->key_enc_algo = key_enc_algo;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++	return 0;
++}
++
++static bool is_key_pkey(char **datablob)
++{
++	char *c = NULL;
++
++	do {
++		/* Second argument onwards,
++		 * determine if tied to HW
++		 */
++		c = strsep(datablob, " \t");
++		if (c && (strcmp(c, "pk") == 0))
++			return true;
++	} while (c);
++
++	return false;
++}
++
+ static int trusted_caam_seal(struct trusted_key_payload *p, char *datablob)
+ {
+ 	int ret;
+@@ -25,11 +98,30 @@ static int trusted_caam_seal(struct trusted_key_payload *p, char *datablob)
+ 		.key_mod = KEYMOD, .key_mod_len = sizeof(KEYMOD) - 1,
+ 	};
+ 
++	/*
++	 * If it is to be treated as protected key,
++	 * read next arguments too.
++	 */
++	if (is_key_pkey(&datablob)) {
++		info.pkey_info.plain_key_sz = p->key_len;
++		info.pkey_info.is_pkey = 1;
++		ret = get_pkey_options(datablob, &info.pkey_info);
++		if (ret < 0)
++			return 0;
++		dump_options(info.pkey_info);
++	}
++
+ 	ret = caam_encap_blob(blobifier, &info);
+ 	if (ret)
+ 		return ret;
+ 
+ 	p->blob_len = info.output_len;
++	if (info.pkey_info.is_pkey) {
++		p->key_len = p->blob_len + sizeof(struct caam_pkey_info);
++		memcpy(p->key, &info.pkey_info, sizeof(struct caam_pkey_info));
++		memcpy(p->key + sizeof(struct caam_pkey_info), p->blob, p->blob_len);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -42,11 +134,27 @@ static int trusted_caam_unseal(struct trusted_key_payload *p, char *datablob)
+ 		.key_mod = KEYMOD,  .key_mod_len = sizeof(KEYMOD) - 1,
+ 	};
+ 
++	if (is_key_pkey(&datablob)) {
++		info.pkey_info.plain_key_sz = p->blob_len - CAAM_BLOB_OVERHEAD;
++		info.pkey_info.is_pkey = 1;
++		ret = get_pkey_options(datablob, &info.pkey_info);
++		if (ret < 0)
++			return 0;
++		dump_options(info.pkey_info);
++
++		p->key_len = p->blob_len + sizeof(struct caam_pkey_info);
++		memcpy(p->key, &info.pkey_info, sizeof(struct caam_pkey_info));
++		memcpy(p->key + sizeof(struct caam_pkey_info), p->blob, p->blob_len);
++
++		return 0;
++	}
++
+ 	ret = caam_decap_blob(blobifier, &info);
+ 	if (ret)
+ 		return ret;
+ 
+ 	p->key_len = info.output_len;
++
+ 	return 0;
+ }
+ 
+-- 
+2.47.3
+
