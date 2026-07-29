@@ -4,6 +4,8 @@ SRC_URI += "file://${MACHINE}.cfg"
 
 SRC_URI += "file://0001-arm64-dts-lx2160a-enable-crypto-device-node-for-CAAM.patch"
 
+SRC_URI += "file://0001-crypto-caam-drop-CRYPTO_ALG_ALLOCATES_MEMORY-on-paes.patch"
+
 KBUILD_DEFCONFIG:tqma8mpxl = "defconfig"
 KBUILD_DEFCONFIG:tqmlx2160a = "defconfig"
 KBUILD_DEFCONFIG:ls1088ardb-pb = "defconfig"

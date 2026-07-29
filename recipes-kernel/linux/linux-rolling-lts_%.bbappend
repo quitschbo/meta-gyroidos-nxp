@@ -6,6 +6,7 @@ SRC_URI += "\
         file://0001-docs-trusted-encrypted-trusted-keys-as-protected-key.patch \
         file://0002-KEYS-trusted-caam-based-protected-key.patch \
         file://0003-crypto-caam-Add-support-of-paes-algorithm.patch \
+        file://0001-crypto-caam-drop-CRYPTO_ALG_ALLOCATES_MEMORY-on-paes.patch \
 "
 
 KBUILD_DEFCONFIG:tqmlx2160a = "defconfig"

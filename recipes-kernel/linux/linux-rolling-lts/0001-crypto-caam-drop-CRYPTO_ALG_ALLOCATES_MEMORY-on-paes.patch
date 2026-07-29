@@ -1,0 +1,44 @@
+From bf0426a66f1354911a03d5de3b9eb71188574692 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michael=20Wei=C3=9F?= <michael.weiss@aisec.fraunhofer.de>
+Date: Mon, 27 Jul 2026 16:49:29 +0200
+Subject: [PATCH] crypto: caam - drop CRYPTO_ALG_ALLOCATES_MEMORY on paes
+ algorithm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Since dm-crypt rejects algorithms which do memory allocation,
+flagged by CRYPTO_ALG_ALLOCATES_MEMORY disk encryption is not
+allowed. To keep caam paes algorithm usable for dm-crypt based
+disk encryption with protected keys within the CAAM, just drop
+that flag during instantiation.
+
+Signed-off-by: Michael Weiß <michael.weiss@aisec.fraunhofer.de>
+---
+ drivers/crypto/caam/caamalg.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/caam/caamalg.c b/drivers/crypto/caam/caamalg.c
+index ddbd60cf3b3c..9026468f1036 100644
+--- a/drivers/crypto/caam/caamalg.c
++++ b/drivers/crypto/caam/caamalg.c
+@@ -3819,8 +3819,15 @@ static void caam_skcipher_alg_init(struct caam_skcipher_alg *t_alg)
+ 	alg->base.cra_module = THIS_MODULE;
+ 	alg->base.cra_priority = CAAM_CRA_PRIORITY;
+ 	alg->base.cra_ctxsize = sizeof(struct caam_ctx) + crypto_dma_padding();
+-	alg->base.cra_flags |= (CRYPTO_ALG_ASYNC | CRYPTO_ALG_ALLOCATES_MEMORY |
++	alg->base.cra_flags |= (CRYPTO_ALG_ASYNC |
+ 			      CRYPTO_ALG_KERN_DRIVER_ONLY);
++	/*
++	 * dm-crypt rejects algorithms which do memory allocation, flagged by
++	 * CRYPTO_ALG_ALLOCATES_MEMORY. Keep caam paes algorithm usable
++	 * to allow protected keys within the CAAM for disk encryption.
++	 */
++	if (alg->setkey != paes_skcipher_setkey)
++		alg->base.cra_flags |= CRYPTO_ALG_ALLOCATES_MEMORY;
+ 
+ 	alg->init = caam_cra_init;
+ 	alg->exit = caam_cra_exit;
+-- 
+2.47.3
+
